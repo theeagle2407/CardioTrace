@@ -1,0 +1,480 @@
+import gradio as gr
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import shap
+from fpdf import FPDF
+from sklearn.model_selection import train_test_split
+import warnings, random, os, tempfile, datetime
+warnings.filterwarnings('ignore')
+
+# ── Reproducibility ──────────────────────────────────────────────
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+# ── Load & Train Model (runs once on startup) ────────────────────
+url = "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data"
+cols = ['age','sex','cp','trestbps','chol','fbs','restecg',
+        'thalach','exang','oldpeak','slope','ca','thal','target']
+df = pd.read_csv(url, header=None, names=cols, na_values='?')
+df['target'] = (df['target'] > 0).astype(int)
+df['ca']   = df['ca'].fillna(df['ca'].median())
+df['thal'] = df['thal'].fillna(df['thal'].median())
+df['risk_score'] = (
+    0.3  * df['age']     / df['age'].max() +
+    0.2  * df['trestbps']/ df['trestbps'].max() +
+    0.2  * df['chol']    / df['chol'].max() +
+    0.15 * df['oldpeak'] / df['oldpeak'].max() +
+    0.15 * (1 - df['thalach'] / df['thalach'].max())
+)
+X = df.drop(columns=['target'])
+y = df['target']
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=SEED, stratify=y)
+model = lgb.LGBMClassifier(
+    n_estimators=200, learning_rate=0.05, max_depth=4,
+    num_leaves=15, subsample=0.8, colsample_bytree=0.8,
+    random_state=SEED, verbose=-1)
+model.fit(X_train, y_train)
+explainer = shap.TreeExplainer(model)
+
+# In-memory user store
+user_db = {}
+
+# ── Helper: predict ───────────────────────────────────────────────
+def predict_risk(age, sex, cp, trestbps, chol, fbs, restecg,
+                 thalach, exang, oldpeak, slope, ca, thal):
+    risk_score = (
+        0.3  * age      / df['age'].max() +
+        0.2  * trestbps / df['trestbps'].max() +
+        0.2  * chol     / df['chol'].max() +
+        0.15 * oldpeak  / df['oldpeak'].max() +
+        0.15 * (1 - thalach / df['thalach'].max())
+    )
+    patient = pd.DataFrame([[age, sex, cp, trestbps, chol, fbs, restecg,
+                              thalach, exang, oldpeak, slope, ca, thal, risk_score]],
+                           columns=X.columns)
+    prob       = model.predict_proba(patient)[0][1]
+    risk_level = "HIGH" if prob > 0.6 else "MODERATE" if prob > 0.4 else "LOW"
+    return prob, risk_level, patient
+
+# ── Helper: trajectory chart ──────────────────────────────────────
+def make_trajectory(age, trestbps, chol, oldpeak, thalach):
+    steps = list(range(1, 6))
+    scores = []
+    for t in steps:
+        s = (
+            0.3  * (age + t)          / df['age'].max() +
+            0.2  * (trestbps + t*1.5) / df['trestbps'].max() +
+            0.2  * (chol + t*2)       / df['chol'].max() +
+            0.15 * (oldpeak + t*0.05) / df['oldpeak'].max() +
+            0.15 * (1 - (thalach - t) / df['thalach'].max())
+        )
+        scores.append(round(s, 4))
+
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('#f8f9fa')
+    ax.plot(steps, scores, marker='o', color='#e63946',
+            linewidth=2.5, markersize=8, label='Risk Score')
+    ax.fill_between(steps, scores, alpha=0.12, color='#e63946')
+    ax.axhline(0.6, color='#e63946', linestyle='--', alpha=0.5, linewidth=1, label='High Risk Threshold')
+    ax.axhline(0.4, color='#f4a261', linestyle='--', alpha=0.5, linewidth=1, label='Moderate Threshold')
+    ax.set_xlabel('Simulated Time Step (Years)', fontsize=11)
+    ax.set_ylabel('Composite Risk Score', fontsize=11)
+    ax.set_title('Cardiovascular Risk Trajectory', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    path = tempfile.mktemp(suffix='.png')
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
+# ── Helper: SHAP chart ────────────────────────────────────────────
+def make_shap(patient_df):
+    sv = explainer.shap_values(patient_df)
+    if isinstance(sv, list):
+        sv = sv[1]
+    sv = sv.flatten()
+    features  = list(X.columns)
+    pairs     = sorted(zip(features, sv), key=lambda x: abs(x[1]), reverse=True)[:8]
+    feats, vals = zip(*pairs)
+    colors = ['#e63946' if v > 0 else '#2a9d8f' for v in vals]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('#f8f9fa')
+    bars = ax.barh(feats, vals, color=colors, edgecolor='white', linewidth=0.5)
+    ax.set_xlabel('SHAP Value (Impact on Risk)', fontsize=11)
+    ax.set_title('Feature Contribution to This Patient\'s Risk', fontsize=12, fontweight='bold')
+    ax.axvline(0, color='black', linewidth=0.8)
+    ax.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    path = tempfile.mktemp(suffix='.png')
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
+# ── Helper: PDF report ────────────────────────────────────────────
+def make_pdf(user_name, age, sex, trestbps, chol, thalach,
+             oldpeak, prob, risk_level, traj_path, shap_path):
+    pdf = FPDF()
+    pdf.add_page()
+
+    # Header
+    pdf.set_fill_color(26, 26, 46)
+    pdf.rect(0, 0, 210, 40, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 22)
+    pdf.set_xy(0, 10)
+    pdf.cell(210, 10, 'CardioTrace', align='C')
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(0, 24)
+    pdf.cell(210, 8, 'Mapping the Future of Cardiovascular Risk', align='C')
+
+    # Patient info
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_xy(15, 50)
+    pdf.set_font('Helvetica', 'B', 13)
+    pdf.cell(0, 8, 'Patient Risk Report')
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(15, 60)
+    pdf.cell(0, 6, f'Generated for: {user_name}')
+    pdf.set_xy(15, 67)
+    pdf.cell(0, 6, f'Date: {datetime.datetime.now().strftime("%B %d, %Y")}')
+
+    # Risk result box
+    r, g, b = (230,57,70) if risk_level=="HIGH" else (244,162,97) if risk_level=="MODERATE" else (42,157,143)
+    pdf.set_fill_color(r, g, b)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(15, 78)
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.cell(180, 14, f'  Risk Level: {risk_level}   |   Probability: {prob:.1%}', fill=True, border=0)
+
+    # Clinical values
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_xy(15, 100)
+    pdf.cell(0, 7, 'Clinical Parameters')
+    pdf.set_font('Helvetica', '', 10)
+    params = [
+        ('Age', f'{int(age)} years'),
+        ('Sex', 'Male' if sex==1 else 'Female'),
+        ('Resting Blood Pressure', f'{int(trestbps)} mmHg'),
+        ('Cholesterol', f'{int(chol)} mg/dl'),
+        ('Max Heart Rate', f'{int(thalach)} bpm'),
+        ('ST Depression (Oldpeak)', f'{oldpeak}'),
+    ]
+    y_pos = 109
+    for label, val in params:
+        pdf.set_xy(15, y_pos)
+        pdf.cell(90, 6, label)
+        pdf.cell(60, 6, val)
+        y_pos += 7
+
+    # Charts
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_xy(15, y_pos + 5)
+    pdf.cell(0, 7, 'Risk Trajectory Over Time')
+    pdf.image(traj_path, x=15, y=y_pos+13, w=175)
+
+    pdf.add_page()
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_xy(15, 15)
+    pdf.cell(0, 7, 'Feature Contribution Analysis (SHAP)')
+    pdf.image(shap_path, x=15, y=25, w=175)
+
+    # Disclaimer
+    pdf.set_xy(15, 160)
+    pdf.set_font('Helvetica', 'I', 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(180, 5,
+        'Disclaimer: This report is generated by CardioTrace for research and educational '
+        'purposes only. It is not a substitute for professional medical advice, diagnosis, '
+        'or treatment. Always consult a qualified healthcare provider.')
+
+    path = tempfile.mktemp(suffix='.pdf')
+    pdf.output(path)
+    return path
+
+# ── GRADIO UI ─────────────────────────────────────────────────────
+clinical_css = """
+body, .gradio-container {
+    background: #f0f4f8 !important;
+    font-family: 'Segoe UI', sans-serif;
+}
+#login-box, #signup-box {
+    background: white;
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    max-width: 420px;
+    margin: 60px auto;
+}
+#main-app { display: none; }
+.risk-card {
+    border-radius: 14px;
+    padding: 24px;
+    text-align: center;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.07);
+}
+.section-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #6b7280;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+footer { display: none !important; }
+"""
+
+with gr.Blocks(css=clinical_css, title="CardioTrace") as app:
+
+    # ── State ──
+    session_user = gr.State("")
+
+    # ── HEADER ──
+    gr.HTML("""
+    <div style="background:white; border-bottom:1px solid #e5e7eb;
+                padding:16px 32px; display:flex; align-items:center; gap:12px;
+                box-shadow:0 1px 4px rgba(0,0,0,0.06);">
+        <div style="font-size:28px;">🫀</div>
+        <div>
+            <div style="font-size:20px; font-weight:700; color:#1a1a2e;">CardioTrace</div>
+            <div style="font-size:11px; color:#9ca3af; letter-spacing:2px;">
+                MAPPING THE FUTURE OF CARDIOVASCULAR RISK
+            </div>
+        </div>
+    </div>
+    """)
+
+    # ════════════════════════════════════════
+    # AUTH SCREEN
+    # ════════════════════════════════════════
+    with gr.Column(visible=True) as auth_screen:
+        with gr.Tabs():
+
+            # ── Sign Up ──
+            with gr.Tab("Create Account"):
+                gr.HTML("""
+                <div style="text-align:center; padding:24px 0 8px;">
+                    <div style="font-size:36px;">🏥</div>
+                    <h2 style="color:#1a1a2e; margin:8px 0 4px;">Create Your Account</h2>
+                    <p style="color:#6b7280; font-size:13px;">
+                        Join CardioTrace — Clinical Risk Intelligence Platform
+                    </p>
+                </div>
+                """)
+                su_name  = gr.Textbox(label="Full Name", placeholder="e.g. Elijah Oreoluwa")
+                su_email = gr.Textbox(label="Email Address", placeholder="you@hospital.org")
+                su_pass  = gr.Textbox(label="Password", type="password", placeholder="Min 6 characters")
+                su_role  = gr.Dropdown(
+                    ["Cardiologist", "General Practitioner", "Medical Researcher",
+                     "Nurse Practitioner", "Medical Student"],
+                    label="Role", value="Medical Researcher")
+                su_btn   = gr.Button("Create Account", variant="primary", size="lg")
+                su_msg   = gr.HTML()
+
+            # ── Login ──
+            with gr.Tab("Sign In"):
+                gr.HTML("""
+                <div style="text-align:center; padding:24px 0 8px;">
+                    <div style="font-size:36px;">🔐</div>
+                    <h2 style="color:#1a1a2e; margin:8px 0 4px;">Welcome Back</h2>
+                    <p style="color:#6b7280; font-size:13px;">Sign in to access your dashboard</p>
+                </div>
+                """)
+                li_email = gr.Textbox(label="Email Address", placeholder="you@hospital.org")
+                li_pass  = gr.Textbox(label="Password", type="password")
+                li_btn   = gr.Button("Sign In", variant="primary", size="lg")
+                li_msg   = gr.HTML()
+
+    # ════════════════════════════════════════
+    # MAIN APP SCREEN
+    # ════════════════════════════════════════
+    with gr.Column(visible=False) as main_screen:
+
+        # Welcome bar
+        welcome_bar = gr.HTML()
+
+        gr.HTML("""
+        <div style="padding:12px 24px 0;">
+            <h3 style="color:#1a1a2e; margin:0;">Patient Risk Assessment</h3>
+            <p style="color:#6b7280; font-size:13px; margin:4px 0 0;">
+                Enter patient clinical parameters to generate a cardiovascular risk profile.
+            </p>
+        </div>
+        """)
+
+        with gr.Row(equal_height=False):
+
+            # ── Input panel ──
+            with gr.Column(scale=1):
+                with gr.Group():
+                    gr.HTML('<div class="section-title" style="padding:12px 12px 0;">Patient Profile</div>')
+                    age      = gr.Slider(20, 80, value=55,  label="Age (years)")
+                    sex      = gr.Radio([("Female", 0), ("Male", 1)], value=1, label="Sex")
+                    cp       = gr.Slider(1, 4, step=1, value=3,
+                                         label="Chest Pain Type (1=Typical, 2=Atypical, 3=Non-anginal, 4=Asymptomatic)")
+                    trestbps = gr.Slider(90, 200, value=140, label="Resting Blood Pressure (mmHg)")
+                    chol     = gr.Slider(100, 400, value=250, label="Serum Cholesterol (mg/dl)")
+                    fbs      = gr.Radio([("No", 0), ("Yes", 1)], value=0,
+                                        label="Fasting Blood Sugar > 120 mg/dl")
+                    restecg  = gr.Slider(0, 2, step=1, value=1,
+                                          label="Resting ECG (0=Normal, 1=ST-T Abnormality, 2=LV Hypertrophy)")
+
+                with gr.Group():
+                    gr.HTML('<div class="section-title" style="padding:12px 12px 0;">Clinical Indicators</div>')
+                    thalach  = gr.Slider(60, 210, value=150, label="Maximum Heart Rate Achieved (bpm)")
+                    exang    = gr.Radio([("No", 0), ("Yes", 1)], value=0,
+                                        label="Exercise Induced Angina")
+                    oldpeak  = gr.Slider(0.0, 6.0, step=0.1, value=1.5,
+                                          label="ST Depression Induced by Exercise (Oldpeak)")
+                    slope    = gr.Slider(1, 3, step=1, value=2,
+                                          label="Slope of Peak Exercise ST Segment")
+                    ca       = gr.Slider(0, 3, step=1, value=0,
+                                          label="Number of Major Vessels Colored by Fluoroscopy")
+                    thal     = gr.Slider(3, 7, step=1, value=3,
+                                          label="Thalassemia (3=Normal, 6=Fixed Defect, 7=Reversible)")
+
+                analyze_btn = gr.Button("Generate Risk Assessment", variant="primary", size="lg")
+
+            # ── Output panel ──
+            with gr.Column(scale=1):
+                result_html = gr.HTML()
+
+                with gr.Tabs():
+                    with gr.Tab("Risk Trajectory"):
+                        traj_img = gr.Image(label="", show_label=False, height=300)
+                    with gr.Tab("SHAP Analysis"):
+                        shap_img = gr.Image(label="", show_label=False, height=300)
+                    with gr.Tab("Download Report"):
+                        gr.HTML("""
+                        <div style="padding:16px; color:#6b7280; font-size:13px;">
+                            Run the assessment first, then download your PDF report below.
+                        </div>
+                        """)
+                        pdf_file = gr.File(label="Patient Risk Report (PDF)")
+
+        logout_btn = gr.Button("Sign Out", size="sm", variant="secondary")
+
+    # ════════════════════════════════════════
+    # LOGIC
+    # ════════════════════════════════════════
+
+    def signup(name, email, password):
+        if not name or not email or not password:
+            return gr.update(), gr.HTML(
+                '<p style="color:#e63946; font-size:13px;">All fields are required.</p>')
+        if len(password) < 6:
+            return gr.update(), gr.HTML(
+                '<p style="color:#e63946; font-size:13px;">Password must be at least 6 characters.</p>')
+        if email in user_db:
+            return gr.update(), gr.HTML(
+                '<p style="color:#e63946; font-size:13px;">Email already registered. Please sign in.</p>')
+        user_db[email] = {"name": name, "password": password}
+        return gr.update(), gr.HTML(
+            '<p style="color:#2a9d8f; font-size:13px;">Account created! Please sign in.</p>')
+
+    def login(email, password, session):
+        if email not in user_db:
+            return (gr.update(visible=True), gr.update(visible=False),
+                    session,
+                    gr.HTML('<p style="color:#e63946; font-size:13px;">Email not found.</p>'),
+                    gr.HTML())
+        if user_db[email]["password"] != password:
+            return (gr.update(visible=True), gr.update(visible=False),
+                    session,
+                    gr.HTML('<p style="color:#e63946; font-size:13px;">Incorrect password.</p>'),
+                    gr.HTML())
+        name = user_db[email]["name"]
+        welcome = f"""
+        <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px;
+                    padding:12px 20px; margin:12px 24px; display:flex;
+                    align-items:center; gap:10px;">
+            <span style="font-size:20px;">👋</span>
+            <span style="color:#166534; font-size:14px; font-weight:500;">
+                Welcome back, <strong>{name}</strong>. Ready to assess cardiovascular risk.
+            </span>
+        </div>
+        """
+        return (gr.update(visible=False), gr.update(visible=True),
+                name, gr.HTML(), gr.HTML(welcome))
+
+    def logout(session):
+        return gr.update(visible=True), gr.update(visible=False), "", gr.HTML()
+
+    def run_assessment(session_user, age, sex, cp, trestbps, chol, fbs,
+                       restecg, thalach, exang, oldpeak, slope, ca, thal):
+        prob, level, patient_df = predict_risk(
+            age, sex, cp, trestbps, chol, fbs,
+            restecg, thalach, exang, oldpeak, slope, ca, thal)
+
+        color = "#e63946" if level=="HIGH" else "#f4a261" if level=="MODERATE" else "#2a9d8f"
+        bg    = "#fff5f5" if level=="HIGH" else "#fffbf0" if level=="MODERATE" else "#f0fdf4"
+        heart = "🫀" if level=="HIGH" else "💛" if level=="MODERATE" else "❤️"
+
+        advice = {
+            "HIGH":     "Immediate clinical evaluation strongly recommended. Consider cardiology referral.",
+            "MODERATE": "Lifestyle modifications advised. Schedule follow-up within 3 months.",
+            "LOW":      "Continue preventive care. Annual cardiovascular screening recommended."
+        }
+
+        result = f"""
+        <div style="background:{bg}; border:2px solid {color}; border-radius:14px;
+                    padding:24px; text-align:center; margin-bottom:16px;">
+            <div style="font-size:48px;">{heart}</div>
+            <div style="font-size:12px; color:#6b7280; letter-spacing:2px;
+                        text-transform:uppercase; margin:8px 0 4px;">
+                Cardiovascular Risk Level
+            </div>
+            <div style="font-size:36px; font-weight:700; color:{color};">{level}</div>
+            <div style="font-size:28px; font-weight:600; color:{color}; margin:4px 0;">
+                {prob:.1%}
+            </div>
+            <div style="font-size:12px; color:#6b7280;">probability of disease</div>
+            <div style="margin-top:16px; background:white; border-radius:10px;
+                        padding:12px 16px; font-size:13px; color:#374151; text-align:left;">
+                <strong>Clinical Recommendation:</strong> {advice[level]}
+            </div>
+        </div>
+        """
+
+        traj_path = make_trajectory(age, trestbps, chol, oldpeak, thalach)
+        shap_path = make_shap(patient_df)
+        pdf_path  = make_pdf(
+            session_user, age, sex, trestbps, chol, thalach,
+            oldpeak, prob, level, traj_path, shap_path)
+
+        return result, traj_path, shap_path, pdf_path
+
+    # ── Wire up ──
+    su_btn.click(
+        signup,
+        inputs=[su_name, su_email, su_pass],
+        outputs=[su_msg, su_msg])
+
+    li_btn.click(
+        login,
+        inputs=[li_email, li_pass, session_user],
+        outputs=[auth_screen, main_screen, session_user, li_msg, welcome_bar])
+
+    logout_btn.click(
+        logout,
+        inputs=[session_user],
+        outputs=[auth_screen, main_screen, session_user, welcome_bar])
+
+    analyze_btn.click(
+        run_assessment,
+        inputs=[session_user, age, sex, cp, trestbps, chol, fbs,
+                restecg, thalach, exang, oldpeak, slope, ca, thal],
+        outputs=[result_html, traj_img, shap_img, pdf_file])
+
+app.launch()
