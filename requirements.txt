@@ -1,0 +1,10 @@
+lightgbm
+shap
+gradio
+fpdf2
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+plotly
