@@ -1,7 +1,7 @@
 # CardioTrace
 ### Mapping the Future of Cardiovascular Risk
 
-**Hackathon:** Byte 2 Beat — Hack4Health 2026  
+**Hackathon:** Byte 2 Beat - Hack4Health 2026  
 **Author:** Elijah Oreoluwa  
 **Live App:** https://huggingface.co/spaces/Elijahoreoluwa1/CardioTrace
 
